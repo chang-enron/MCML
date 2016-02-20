@@ -1,0 +1,634 @@
+#pragma OPENCL EXTENSION cl_amd_printf : enable
+
+#define PI 3.1415926
+#define WEIGHT 1E-4		/* Critical weight for roulette. */
+#define CHANCE 0.1		/* Chance of roulette survival. */
+#define STRLEN 256		/* String length. */
+
+#define Boolean char
+#define USE_FLOAT 0
+#if USE_FLOAT
+    #define REAL float
+#else
+    #define REAL double
+#endif
+#define MaxSteps 4096
+#define MaxLayers 32		
+#define PARTIALREFLECTION 0     
+#define COSZERO (1.0-1.0E-12)	
+#define COS90D  1.0E-6		
+#define SIGN(x) ((x)>=0 ? 1:-1)
+
+#define DEBUG 0
+
+#if DEBUG 
+constant int maxir=0, minir=999, maxiz=0, miniz=999;
+#endif
+
+typedef struct {
+    REAL z0, z1;	/* z coordinates of a layer. [cm] */
+    REAL n;			/* refractive index of a layer. */
+    REAL mua;	    /* absorption coefficient. [1/cm] */
+    REAL mus;	    /* scattering coefficient. [1/cm] */
+    REAL g;		    /* anisotropy. */
+
+    REAL cos_crit0,	cos_crit1;	
+} LayerStruct;
+
+typedef struct {
+    char	 out_fname[STRLEN];	/* output file name. */
+    char	 out_fformat;		/* output file format. */
+    /* 'A' for ASCII, */
+    /* 'B' for binary. */
+    long	 num_photons; 		/* to be traced. */
+    REAL Wth; 				/* play roulette if photon */
+    /* weight < Wth.*/
+
+    REAL dz;				/* z grid separation.[cm] */ 
+    REAL dr;				/* r grid separation.[cm] */
+    REAL da;				/* alpha grid separation. */
+    /* [radian] */
+    short nz;					/* array range 0..nz-1. */
+    short nr;					/* array range 0..nr-1. */
+    short na;					/* array range 0..na-1. */
+
+    short	num_layers;			/* number of layers. */
+    LayerStruct layerspecs[MaxLayers];	/* layer parameters. */	
+} cl_InputStruct;
+
+typedef struct {
+    REAL x, y ,z;	/* Cartesian coordinates.[cm] */
+    REAL ux, uy, uz;/* directional cosines of a photon. */
+    REAL w;			/* weight. */
+    Boolean dead;		/* 1 if photon is terminated. */
+    /* packet resides. */
+    REAL s;			/* current step size. [cm]. */
+    REAL sleft;		/* step size left. dimensionless [-]. */
+    REAL dwa;		/* step size left. dimensionless [-]. */
+    short layer;		/* index to layer where the photon */
+    short ir , iz ;
+    short steps   ;
+} cl_PhotonStruct;
+
+typedef struct {
+    short   x, y;
+    REAL  w;
+} trace;
+
+typedef struct {
+    short  total_steps;
+    short  Rd_valid;
+    short  Tt_valid;
+    trace  data[MaxSteps]; // for Drop
+    trace  Rdra; // for RecordR
+    trace  Ttra;	// for RecordT
+} tmpOutStruct;
+
+void reset_OUT(global tmpOutStruct *TRACE) {
+    TRACE->total_steps = 0;
+    TRACE->Rd_valid = 0;
+    TRACE->Tt_valid = 0;
+}
+
+void StepSizeInGlass(cl_PhotonStruct *  Photon_Ptr,
+        constant cl_InputStruct  *  In_Ptr)
+{
+    REAL dl_b;	/* step size to boundary. */
+    short  layer = Photon_Ptr->layer;
+    REAL uz = Photon_Ptr->uz;
+
+    /* Stepsize to the boundary. */	
+    if(uz>0.0)  //往 +z 移動, 走向底層, 底界線 - 目前位置
+        dl_b = (In_Ptr->layerspecs[layer].z1 - Photon_Ptr->z)
+            /uz;
+    else if(uz<0.0) //往-z 移動, 走向上層, 頂界線 - 目前位置
+        dl_b = (In_Ptr->layerspecs[layer].z0 - Photon_Ptr->z)
+            /uz;
+    else
+        dl_b = 0.0;
+
+    Photon_Ptr->s = dl_b;  //step size : 離邊界的距離
+}
+
+void Hop(cl_PhotonStruct *	Photon_Ptr)
+{
+    REAL s = Photon_Ptr->s;
+
+    Photon_Ptr->x += s*Photon_Ptr->ux;  // 下一個分量位置= 
+    Photon_Ptr->y += s*Photon_Ptr->uy;  //    原來位置+ step size * 方向分量
+    Photon_Ptr->z += s*Photon_Ptr->uz;
+}			
+
+REAL RFresnel(REAL n1,	/* incident refractive index.*/
+        REAL n2,	/* transmit refractive index.*/
+        REAL ca1,	/* cosine of the incident */
+        /* angle. 0<a1<90 degrees. */
+        REAL * ca2_Ptr)  /* pointer to the */
+/* cosine of the transmission */
+/* angle. a2>0. */
+{
+    REAL r;
+
+    if(n1==n2) {			  	/** matched boundary. **/
+        *ca2_Ptr = ca1;
+        r = 0.0;
+    }
+    else if(ca1>COSZERO) {	/** normal incident. **/
+        *ca2_Ptr = ca1;
+        r = (n2-n1)/(n2+n1);
+        r *= r;
+    }
+    else  {			  		/** general. **/
+        REAL sa1, sa2;	
+        /* sine of the incident and transmission angles. */
+        REAL ca2;
+
+        sa1 = sqrt(1-ca1*ca1);
+        sa2 = n1*sa1/n2;
+        if(sa2>=1.0) {	
+            /* REAL check for total internal reflection. */
+            *ca2_Ptr = 0.0;
+            r = 1.0;
+        }
+        else  {
+            REAL cap, cam;	/* cosines of the sum ap or */
+            /* difference am of the two */
+            /* angles. ap = a1+a2 */
+            /* am = a1 - a2. */
+            REAL sap, sam;	/* sines. */
+
+            *ca2_Ptr = ca2 = sqrt(1-sa2*sa2);
+
+            cap = ca1*ca2 - sa1*sa2; /* c+ = cc - ss. */
+            cam = ca1*ca2 + sa1*sa2; /* c- = cc + ss. */
+            sap = sa1*ca2 + ca1*sa2; /* s+ = sc + cs. */
+            sam = sa1*ca2 - ca1*sa2; /* s- = sc - cs. */
+            r = 0.5*sam*sam*(cam*cam+cap*cap)/(sap*sap*cam*cam); 
+            /* rearranged for speed. */
+        }
+    }
+    return(r);
+}
+
+__constant REAL g_scale1 = (REAL)(1.0)/0x7FFF;
+
+REAL RandomNum(unsigned int *g_seed) { 
+    REAL a;
+    *g_seed = (214013*(*g_seed)+2531011); 
+    a = ((*g_seed>>16)&0x7FFF) * g_scale1;
+    return(a);
+} 
+
+void RecordR(REAL			Refl,	/* reflectance. */
+        constant cl_InputStruct  *	In_Ptr,
+        cl_PhotonStruct *	Photon_Ptr,
+        global tmpOutStruct *	Out_Ptr)
+{
+    REAL x = Photon_Ptr->x;
+    REAL y = Photon_Ptr->y;
+    short  ir, ia;	/* index to r & angle. */
+    REAL ird, iad;	/* LW 5/20/98. To avoid out of short range.*/
+
+    ird = sqrt(x*x+y*y)/In_Ptr->dr;
+    if(ird>In_Ptr->nr-1) ir=In_Ptr->nr-1;
+    else ir = ird;
+
+    iad = acos(-Photon_Ptr->uz)/In_Ptr->da;
+    if(iad>In_Ptr->na-1) ia=In_Ptr->na-1;
+    else ia = iad;
+
+    /* assign photon to the reflection array element. */
+    // Out_Ptr->Rdra[ir][ia] += Photon_Ptr->w*(1.0-Refl);
+
+    // For PARTIALREFLECTION = 0
+    Out_Ptr->Rd_valid = 1;
+    Out_Ptr->Rdra.x = ir;
+    Out_Ptr->Rdra.y = ia;
+    Out_Ptr->Rdra.w = Photon_Ptr->w*(1.0-Refl);
+
+    Out_Ptr->data[Photon_Ptr->steps].x = Photon_Ptr->ir;
+    Out_Ptr->data[Photon_Ptr->steps].y = Photon_Ptr->iz;
+    Out_Ptr->data[Photon_Ptr->steps].w = Photon_Ptr->dwa;
+    Photon_Ptr->w *= Refl;
+}
+
+void CrossUpOrNot(
+        unsigned int *priv_seed,
+        constant cl_InputStruct  *	In_Ptr, 
+        cl_PhotonStruct *	Photon_Ptr,
+        global tmpOutStruct *		Out_Ptr)
+{
+    REAL uz = Photon_Ptr->uz; /* z directional cosine. */
+    REAL uz1;	/* cosines of transmission alpha. always */
+    /* positive. */
+    REAL r=0.0;	/* reflectance */
+    short  layer = Photon_Ptr->layer;
+    REAL ni = In_Ptr->layerspecs[layer].n;
+    REAL nt = In_Ptr->layerspecs[layer-1].n;
+
+    /* Get r. */
+    if( - uz <= In_Ptr->layerspecs[layer].cos_crit0) //z分量 與 臨界角
+        r=1.0;		      /* total internal reflection. *///全反射
+    else r = RFresnel(ni, nt, -uz, &uz1);  //Fresnel equation : 反射與折射的關係
+
+    if(RandomNum(priv_seed) > r) {		/* transmitted to layer-1. */ //回到上一layer
+        if(layer==1)  {  //top layer => 結束
+            Photon_Ptr->uz = -uz1;
+            RecordR(0.0, In_Ptr, Photon_Ptr, Out_Ptr); // 紀錄最終資訊
+            Photon_Ptr->dead = 1;
+        }
+        else {
+            Photon_Ptr->layer--;
+            Photon_Ptr->ux *= ni/nt;
+            Photon_Ptr->uy *= ni/nt;
+            Photon_Ptr->uz = -uz1;
+        }
+    }
+    else 						/* reflected. */  //當 layer 反方向
+        Photon_Ptr->uz = -uz;
+}
+
+void RecordT(REAL 		Refl,
+        constant cl_InputStruct  *	In_Ptr,
+        cl_PhotonStruct *	Photon_Ptr,
+        global tmpOutStruct *	Out_Ptr)
+{
+    REAL x = Photon_Ptr->x;
+    REAL y = Photon_Ptr->y;
+    short  ir, ia;	/* index to r & angle. */
+    REAL ird, iad;	/* LW 5/20/98. To avoid out of short range.*/
+
+    ird = sqrt(x*x+y*y)/In_Ptr->dr;
+    if(ird>In_Ptr->nr-1) ir=In_Ptr->nr-1;
+    else ir = ird;
+
+    iad = acos(Photon_Ptr->uz)/In_Ptr->da; /* LW 1/12/2000. Removed -. */
+    if(iad>In_Ptr->na-1) ia=In_Ptr->na-1;
+    else ia = iad;
+
+    /* assign photon to the transmittance array element. */
+    // Out_Ptr->Tt_ra[ir][ia] += Photon_Ptr->w*(1.0-Refl);
+
+    Out_Ptr->Tt_valid = 1;
+    Out_Ptr->Ttra.x = ir;
+    Out_Ptr->Ttra.y = ia;
+    Out_Ptr->Ttra.w = Photon_Ptr->w*(1.0-Refl);
+    Out_Ptr->data[Photon_Ptr->steps].x = Photon_Ptr->ir;
+    Out_Ptr->data[Photon_Ptr->steps].y = Photon_Ptr->iz;
+    Out_Ptr->data[Photon_Ptr->steps].w = Photon_Ptr->dwa;
+
+    Photon_Ptr->w *= Refl;
+}
+
+void CrossDnOrNot(
+        unsigned int * priv_seed,
+        constant cl_InputStruct  * In_Ptr, 
+        cl_PhotonStruct * Photon_Ptr,
+        global tmpOutStruct * Out_Ptr)
+{
+
+    REAL uz = Photon_Ptr->uz; /* z directional cosine. */
+    REAL uz1;	/* cosines of transmission alpha. */
+    REAL r=0.0;	/* reflectance */
+    short  layer = Photon_Ptr->layer;
+    REAL ni = In_Ptr->layerspecs[layer].n;
+    REAL nt = In_Ptr->layerspecs[layer+1].n;
+
+    /* Get r. */
+    if( uz <= In_Ptr->layerspecs[layer].cos_crit1) 
+        r=1.0;		/* total internal reflection. */
+    else r = RFresnel(ni, nt, uz, &uz1);
+
+    if(RandomNum(priv_seed) > r) {		/* transmitted to layer+1. */
+        if(layer == In_Ptr->num_layers) {    //最底 layer
+            Photon_Ptr->uz = uz1;
+            RecordT(0.0, In_Ptr, Photon_Ptr, Out_Ptr);
+            Photon_Ptr->dead = 1;
+        }
+        else {
+            Photon_Ptr->layer++;
+            Photon_Ptr->ux *= ni/nt;
+            Photon_Ptr->uy *= ni/nt;
+            Photon_Ptr->uz = uz1;
+        }
+    }
+    else 						/* reflected. */
+        Photon_Ptr->uz = -uz;
+}
+
+void CrossOrNot(
+        unsigned int *priv_seed,
+        constant cl_InputStruct  *	In_Ptr, 
+        cl_PhotonStruct *	Photon_Ptr,
+        global tmpOutStruct    *	Out_Ptr)
+{  
+    /*
+       if(Photon_Ptr->uz < 0.0)  
+       CrossUpOrNot(priv_seed, In_Ptr, Photon_Ptr, Out_Ptr); 
+       else  
+       CrossDnOrNot(priv_seed, In_Ptr, Photon_Ptr, Out_Ptr); 
+     */
+    REAL uz = Photon_Ptr->uz;
+    REAL uz1;
+    REAL r=0.0;
+    short  layer = Photon_Ptr->layer;
+    short  new_layer ;
+    if(uz < 0.0)
+        new_layer = layer - 1 ;
+    else
+        new_layer = layer + 1 ;
+    REAL ni = In_Ptr->layerspecs[layer].n;
+    REAL nt = In_Ptr->layerspecs[new_layer].n;
+    if(uz < 0.0){
+        if( - uz <= In_Ptr->layerspecs[layer].cos_crit0)
+            r=1.0;
+        else r = RFresnel(ni, nt, -uz, &uz1);
+    }
+    else{
+        if( uz <= In_Ptr->layerspecs[layer].cos_crit1)
+            r=1.0;
+        else r = RFresnel(ni, nt, uz, &uz1);
+    }
+    if(RandomNum(priv_seed) > r) {
+        if(layer==1 && uz < 0.0)  {
+            Photon_Ptr->uz = -uz1;
+            RecordR(0.0, In_Ptr, Photon_Ptr, Out_Ptr);
+            Photon_Ptr->dead = 1;
+        }
+        else if(layer == In_Ptr->num_layers && uz > 0.0) {
+            Photon_Ptr->uz = uz1;
+            RecordT(0.0, In_Ptr, Photon_Ptr, Out_Ptr);
+            Photon_Ptr->dead = 1;
+        }
+        else {
+            Photon_Ptr->layer = new_layer;
+            Photon_Ptr->ux *= ni/nt;
+            Photon_Ptr->uy *= ni/nt;
+            if(uz < 0.0)
+                Photon_Ptr->uz = -uz1;
+            else
+                Photon_Ptr->uz = uz1;
+        }
+    }
+    else
+        Photon_Ptr->uz = -uz;
+}
+
+void HopInGlass(
+        unsigned int *priv_seed,
+        constant cl_InputStruct  * In_Ptr,
+        cl_PhotonStruct * Photon_Ptr,
+        global tmpOutStruct    * Out_Ptr)
+{
+    //  REAL dl;     /* step size. 1/cm */
+
+    if(Photon_Ptr->uz == 0.0) { //走 x, y方向的光子不考慮
+        /* horizontal photon in glass is killed. */
+        Photon_Ptr->dead = 1;
+    }
+    else {
+        StepSizeInGlass(Photon_Ptr, In_Ptr);  //算 step size
+        Hop(Photon_Ptr);  // 算下一個位置
+        CrossOrNot(priv_seed, In_Ptr, Photon_Ptr, Out_Ptr);
+    }
+}
+
+void StepSizeInTissue(
+        unsigned int *priv_seed,
+        cl_PhotonStruct * Photon_Ptr,
+        constant cl_InputStruct  * In_Ptr)
+{
+    short  layer = Photon_Ptr->layer;
+    REAL mua = In_Ptr->layerspecs[layer].mua;
+    REAL mus = In_Ptr->layerspecs[layer].mus;
+
+    if(Photon_Ptr->sleft == 0.0) {  /* make a new step. */
+        REAL rnd;    
+        do rnd = RandomNum(priv_seed); 
+        while( rnd <= 0.0 );    /* avoid zero. */ //取出正值
+
+        Photon_Ptr->s = -log(rnd)/(mua+mus);
+    }
+    else {	/* take the leftover. */
+        Photon_Ptr->s = Photon_Ptr->sleft/(mua+mus);
+
+        Photon_Ptr->sleft = 0.0;
+    }
+}
+
+Boolean HitBoundary(cl_PhotonStruct *  Photon_Ptr,
+        constant cl_InputStruct  *  In_Ptr)
+{
+    REAL dl_b;  /* length to boundary. */
+    short  layer = Photon_Ptr->layer;
+    REAL uz = Photon_Ptr->uz;
+    Boolean hit;
+
+    /* Distance to the boundary. */
+    if(uz>0.0)  //+z 方向 (layer bottom)
+        dl_b = (In_Ptr->layerspecs[layer].z1 //(下一layer boundary - 目前位置) / z 速度分量
+                - Photon_Ptr->z)/uz;	/* dl_b>0. */
+    else if(uz<0.0)  //往 -z 方向 (layer top)
+        dl_b = (In_Ptr->layerspecs[layer].z0 
+                - Photon_Ptr->z)/uz;	/* dl_b>0. */
+
+    if(uz != 0.0 && Photon_Ptr->s > dl_b) { 
+        /* not horizontal (!= 0.0) & crossing (step size > dl_b, 走的距離比到邊界距離長). */
+        REAL mut = In_Ptr->layerspecs[layer].mua 
+            + In_Ptr->layerspecs[layer].mus; //損 耗 = 介質吸收 + 反射
+
+        Photon_Ptr->sleft = (Photon_Ptr->s - dl_b)*mut;
+        Photon_Ptr->s    = dl_b;
+        hit = 1;
+    }
+    else
+        hit = 0;
+
+    return(hit);
+}
+
+void Drop(constant cl_InputStruct  *	In_Ptr, 
+        cl_PhotonStruct *	Photon_Ptr,
+        global tmpOutStruct * Out_Ptr,
+        int gid)
+{
+    REAL dwa;		/* absorbed weight.*/
+    REAL x = Photon_Ptr->x;
+    REAL y = Photon_Ptr->y;
+    REAL izd, ird;	/* LW 5/20/98. To avoid out of short range.*/
+    short  iz, ir;	/* index to z & r. */
+    short  layer = Photon_Ptr->layer;
+    REAL mua, mus;		
+
+    /* compute array indices. */
+    izd = Photon_Ptr->z/In_Ptr->dz;
+    if(izd>In_Ptr->nz-1) iz=In_Ptr->nz-1;
+    else iz = izd;
+
+    ird = sqrt(x*x+y*y)/In_Ptr->dr;
+    if(ird>In_Ptr->nr-1) ir=In_Ptr->nr-1;
+    else ir = ird;
+
+    /* update photon weight. */
+    mua = In_Ptr->layerspecs[layer].mua;
+    mus = In_Ptr->layerspecs[layer].mus;
+    dwa = Photon_Ptr->w * mua/(mua+mus);
+    Photon_Ptr->w -= dwa;
+    /* assign dwa to the absorption array element. */
+    // Out_Ptr->A_rz[ir][iz]	+= dwa;
+    if(Photon_Ptr->ir != ir || Photon_Ptr->iz != iz){
+        Out_Ptr->data[Photon_Ptr->steps].x = Photon_Ptr->ir;
+        Out_Ptr->data[Photon_Ptr->steps].y = Photon_Ptr->iz;
+        Out_Ptr->data[Photon_Ptr->steps].w = Photon_Ptr->dwa;
+        Photon_Ptr->steps++;
+        Photon_Ptr->ir = ir;
+        Photon_Ptr->iz = iz;
+        Photon_Ptr->dwa = dwa;
+    }
+    else
+        Photon_Ptr->dwa += dwa;
+
+}
+
+REAL SpinTheta(unsigned int *priv_seed, REAL g)
+{
+    REAL cost;
+
+    if(g == 0.0)  //均向介質
+        cost = 2*RandomNum(priv_seed) -1;
+    else {   /* 非均向介質, 特性隨位置而異 - HG function : 模擬隨機介質所產生之散射  */
+        REAL temp = (1-g*g)/(1-g+2*g*RandomNum(priv_seed));
+        cost = (1+g*g - temp*temp)/(2*g);
+        if(cost < -1) cost = -1;
+        else if(cost > 1) cost = 1;
+    }
+    return(cost);
+}
+
+void Spin(
+        unsigned int *priv_seed,
+        REAL g,
+        cl_PhotonStruct * Photon_Ptr)
+{
+    REAL cost, sint;    /* cosine and sine of the */
+    REAL cosp, sinp;    /* cosine and sine of the */
+    REAL ux = Photon_Ptr->ux;
+    REAL uy = Photon_Ptr->uy;
+    REAL uz = Photon_Ptr->uz;
+    REAL psi;
+    cost = SpinTheta(priv_seed, g);  // -1 <= cost <= 1
+    sint = sqrt(1.0 - cost*cost);
+
+    psi = 2.0*PI*RandomNum(priv_seed); /* spin psi 0-2pi. */
+    cosp = cos(psi);
+
+    REAL cospcosp = sqrt(1.0 - cosp*cosp);
+    if(psi<PI)
+        sinp =   cospcosp;
+    else
+        sinp = - cospcosp;
+    REAL sintcosp = sint*cosp;
+    REAL sintsinp = sint*sinp;
+    if(fabs(uz) > COSZERO)  {
+        Photon_Ptr->ux = sintcosp;
+        Photon_Ptr->uy = sintsinp;
+        Photon_Ptr->uz = cost*SIGN(uz);
+    }
+    else  {
+        REAL temp = sqrt(1.0 - uz*uz);
+        Photon_Ptr->ux = (sintcosp*ux*uz - uy*sintsinp) /temp + ux*cost;
+        Photon_Ptr->uy = (sintcosp*uy*uz + ux*sintsinp) /temp + uy*cost;
+        Photon_Ptr->uz = -sintcosp*temp + uz*cost;
+    }
+
+}
+
+void HopDropSpinInTissue(
+        unsigned int *priv_seed,
+        constant cl_InputStruct  *  In_Ptr,
+        cl_PhotonStruct *  Photon_Ptr,
+        global tmpOutStruct    *  Out_Ptr,
+        int gid)
+{
+    StepSizeInTissue(priv_seed, Photon_Ptr, In_Ptr);
+
+    if(HitBoundary(Photon_Ptr, In_Ptr)) {  /* 判斷是否撞到邊界, 是, 改變參數 s, sleft */
+        Hop(Photon_Ptr);	/* move to boundary plane. */
+        CrossOrNot(priv_seed, In_Ptr, Photon_Ptr, Out_Ptr);
+    }
+    else {
+        Hop(Photon_Ptr);  /* 跳一步到下一個位置x, y, z*/
+        Drop(In_Ptr, Photon_Ptr, Out_Ptr, gid); /* 損失能量, 介質吸收 */ 
+        Spin(priv_seed, In_Ptr->layerspecs[Photon_Ptr->layer].g, 
+                Photon_Ptr); /* 下一步前進的方向 ux, uy, uz */
+    }
+}
+
+void HopDropSpin(
+        unsigned int *priv_seed,
+        constant cl_InputStruct * In_Ptr,
+        cl_PhotonStruct * Photon_Ptr,
+        global tmpOutStruct * Out_Ptr,
+        int gid)
+{
+    HopDropSpinInTissue(priv_seed, In_Ptr, Photon_Ptr, Out_Ptr, gid);
+}
+
+void LaunchPhoton(const REAL Rspecular,
+        constant LayerStruct  * Layerspecs_Ptr,
+        cl_PhotonStruct * Photon_Ptr)
+{
+    Photon_Ptr->w	 	= 1.0 - Rspecular;	
+    Photon_Ptr->dead 	= 0;
+    Photon_Ptr->layer = 1;
+    Photon_Ptr->s	= 0;
+    Photon_Ptr->sleft= 0;
+
+    Photon_Ptr->x 	= 0.0;	
+    Photon_Ptr->y	 	= 0.0;	
+    Photon_Ptr->z	 	= 0.0;	
+    Photon_Ptr->ux	= 0.0;	
+    Photon_Ptr->uy	= 0.0;	
+    Photon_Ptr->uz	= 1.0;
+    Photon_Ptr->dwa     = 0.0;
+    Photon_Ptr->ir      =   0;
+    Photon_Ptr->iz      =   0;
+    Photon_Ptr->steps   =   0;
+
+
+    if((Layerspecs_Ptr[1].mua == 0.0)   //不吸收也不散射 => 玻璃
+            && (Layerspecs_Ptr[1].mus == 0.0))  { /* glass layer. */
+        Photon_Ptr->layer 	= 2;  /* 直接進下一層 */
+        Photon_Ptr->z	= Layerspecs_Ptr[2].z0;	
+    }
+}
+
+__kernel void photon_kernel(
+        __constant cl_InputStruct *In_Ptr,
+        const int  ctrlflag,
+        __constant unsigned int *seed,
+        const REAL rsp,
+        __global tmpOutStruct *OUTstructA,
+        __global tmpOutStruct *OUTstructB
+
+        )
+{
+
+    int gid = get_global_id(0);
+    int flagidx = ctrlflag & 1;
+    cl_PhotonStruct photon;
+
+    __global tmpOutStruct* OUT_ptr[2];
+    OUT_ptr[0] = OUTstructA;
+    OUT_ptr[1] = OUTstructB;
+
+    reset_OUT(&OUT_ptr[flagidx][gid]);
+    LaunchPhoton(rsp, In_Ptr->layerspecs, &photon);
+    unsigned int priv_seed;
+    priv_seed = seed[gid];                 
+    while (!photon.dead){
+        HopDropSpin(&priv_seed, In_Ptr, &photon, &OUT_ptr[flagidx][gid], gid);
+    }
+    OUT_ptr[flagidx][gid].total_steps = photon.steps;
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
